@@ -1,0 +1,344 @@
+// =====================================================================
+// 7_runIndexing.js — RUNS THE COMPLETE INDEXING PIPELINE
+// =====================================================================
+//
+// Command: npm run index -- ./data/movies.pdf
+//
+// Flow:
+//   Step 1: PDF → Gemini → extract entities (structured JSON)
+//   Step 2: entities → Neo4j (graph relationships)
+//   Step 3: PDF → parse text → chunk → embed → Pinecone (vectors)
+// That's it. No caching, no flags. Just run everything.
+// =====================================================================
+
+// =====================================================================
+// 4_entityExtractor.js — STEP 2: PDF → Gemini (with file upload) → JSON
+// =====================================================================
+//
+// Upload PDF ONCE to Gemini Files API → ask "extract movies 1-50" → 20 requests
+// Gemini reads entire PDF in context (1M token window)
+// 1000 movies ÷ 50 per batch = only 20 API calls!
+//
+// RETRY STRATEGY:
+//   - Every batch gets 3 attempts (retries on ANY error, not just 429)
+//   - 429 (rate limit) → wait 30s/60s/90s
+//   - Other errors (parse fail, network, etc.) → wait 10s/20s/30s
+//   - After all batches done → retry ALL failed batches one more time
+//   - Final summary shows exactly which movies were lost (if any)
+// =====================================================================
+
+// =====================================================================
+// 5_graphBuilder.js — STEP 3: Structured JSON → Neo4j Graph
+// =====================================================================
+//
+// Each entity → NODE.  Each connection → RELATIONSHIP.
+//
+// MERGE vs CREATE:
+//   CREATE always makes new node (causes duplicates!)
+//   MERGE first checks "does it exist?" then creates only if needed
+//
+// Example without MERGE:
+//   CREATE (:Actor {name: "Zendaya"})  → for Movie 1
+//   CREATE (:Actor {name: "Zendaya"})  → for Movie 2
+//   Result: TWO Zendaya nodes 
+//
+
+// With MERGE:
+//   MERGE (:Actor {name: "Zendaya"})   → creates it
+//   MERGE (:Actor {name: "Zendaya"})   → finds existing, skips
+//   Result: ONE Zendaya node 
+//
+// INDEXES:
+//   Without index → MERGE scans ALL nodes to find match (slow)
+//   With index    → MERGE uses lookup table (fast)
+// =====================================================================
+
+// =====================================================================
+// 5_graphBuilder.js — STEP 3: Structured JSON → Neo4j Graph
+// =====================================================================
+//
+// Each entity → NODE.  Each connection → RELATIONSHIP.
+//
+// MERGE vs CREATE:
+//   CREATE always makes new node (causes duplicates!)
+//   MERGE first checks "does it exist?" then creates only if needed
+//
+// Example without MERGE:
+//   CREATE (:Actor {name: "Zendaya"})  → for Movie 1
+//   CREATE (:Actor {name: "Zendaya"})  → for Movie 2
+//   Result: TWO Zendaya nodes 
+//
+
+// With MERGE:
+//   MERGE (:Actor {name: "Zendaya"})   → creates it
+//   MERGE (:Actor {name: "Zendaya"})   → finds existing, skips
+//   Result: ONE Zendaya node 
+//
+// INDEXES:
+//   Without index → MERGE scans ALL nodes to find match (slow)
+//   With index    → MERGE uses lookup table (fast)
+// =====================================================================
+
+// =====================================================================
+// 6_vectorStore.js — PDF → Chunks → Embeddings → Pinecone
+// =====================================================================
+//
+// FLOW:
+//   1. Parse PDF → raw text
+//   2. Split text into chunks (by separator)
+//   3. Embed each chunk using Gemini embedding API
+//   4. Upsert to Pinecone
+//
+// WHY NOT @langchain/pinecone?
+//   @langchain/pinecone requires @langchain/core < 0.4.0
+//   but we use @langchain/core 1.x. Incompatible. No fix yet.
+//   So we use Pinecone SDK directly — it's just one upsert call.
+// =====================================================================
+
+/////query phase...............................................................................
+//.........................................................................................................
+
+//Entity Resolution means finding the correct entity and its type (label) from the knowledge graph.
+
+Example:
+User query:
+"Movies directed by Nolan"
+Step 1: Entity Extraction
+LLM extracts:
+["Nolan"]
+Step 2: Entity Resolution
+Search in Neo4j:
+Nolan
+ |
+ |-- Actor?
+ |-- Director?
+ |-- Movie?
+ |-- Genre?
+Graph contains:
+(Director)
+   |
+name: Christopher Nolan
+Resolution result:
+{
+  "searchTerm": "Nolan",
+  "nodeName": "Christopher Nolan",
+  "label": "Director"
+}
+Now the system knows:
+Nolan → Christopher Nolan → Director
+
+//.................................................................................................
+//.................................................................................................
+
+// =====================================================================
+// 9_entityResolver.js — EXTRACT + RESOLVE ENTITIES
+// =====================================================================
+//
+// THIS RUNS FIRST FOR EVERY QUERY. No exceptions.
+// 
+// WHY?
+//   User says "DiCaprio" — is that an Actor? Director? Movie?
+//   User says "Nolan" — same question.
+//   User says "Inception" — could be Movie, could be Theme.
+//   User says "Oscar" — Award? Movie? Actor named Oscar?
+//
+//   WE DON'T KNOW. Only the graph knows.
+//   So we search ALL node types for every entity.
+//
+// FLOW:
+//   Step 1: LLM extracts entity names from the query
+//           "Action movies with Tom Hardy" → ["Action", "Tom Hardy"]
+//
+//   Step 2: For EACH entity, search ALL 6 node types in Neo4j
+//           "Tom Hardy" → Actor , Director , Movie , Genre ...
+//           "Action" → Genre , Actor , Director , Movie ...
+//
+//   Step 3: Return resolved entities with their labels
+//           [
+//             { name: "Tom Hardy", searchTerm: "Tom Hardy", label: "Actor", nodeName: "Tom Hardy" },
+//             { name: "Action", searchTerm: "Action", label: "Genre", nodeName: "Action" }
+//           ]
+//
+// FUZZY MATCHING:
+//   User might say "Nolan" but graph has "Christopher Nolan".
+//   We use CONTAINS for partial matching.
+//   If exact match exists, prefer it over partial match.
+// =====================================================================
+
+// =====================================================================
+// 10_queryClassifier.js — CLASSIFY WITH RESOLVED ENTITY CONTEXT
+// =====================================================================
+//
+// RUNS AFTER entity resolution. The classifier now KNOWS what each
+// entity is (Actor, Movie, Genre, etc.) — no guessing.
+//
+// TWO TYPES:
+//
+//   "graph" — anything answerable from structured data
+//     - Factual: "Movies directed by Nolan" (Director→Movie)
+//     - Descriptive: "Tell me about Inception" (get all relationships)
+//     - Relationship: "How is DiCaprio related to Nolan?" (path finding)
+//     - Filtered: "Action movies with Tom Hardy" (Actor→Movie + Genre filter)
+//     - Counts: "How many sci-fi movies?" (aggregation)
+//
+//   "similarity" — finding similar/recommended items
+//     - "Movies like Inception"
+//     - "Recommend something similar to The Matrix"
+//     - "What should I watch if I liked Interstellar?"
+//
+// WHY ONLY TWO?
+//   Factual, descriptive, relationship — all just "traverse the graph".
+//   The graph handler builds the right Cypher based on resolved entities.
+//   Only similarity needs Pinecone (vector search).
+// =====================================================================
+
+
+// =====================================================================
+// 12_similarityHandler.js — SIMILARITY: Pinecone + Neo4j + LLM
+// =====================================================================
+//
+// FLOW:
+//   Step 1: From resolved entities, find the Movie (already resolved!)
+//   Step 2: Embed movie name → Pinecone → top 50 candidates
+//   Step 3: Neo4j → get source movie's genres
+//   Step 4: Extract movie names from top 50 chunks
+//   Step 5: Neo4j → which of those 50 share the same genres?
+//   Step 6: LLM → pick top 10 from genre-matched list
+//
+// WHY resolved entities help:
+//   "Movies like Inception" → entity resolver already confirmed
+//   Inception = Movie "Inception" in the graph. No extra LLM call needed.
+// =====================================================================
+
+// =====================================================================
+// 11_graphHandler.js — UNIFIED GRAPH QUERY HANDLER
+// =====================================================================
+//
+// Handles ALL graph queries: factual, descriptive, relationship.
+// They're all just "traverse the graph around resolved entities."
+//
+// HOW IT WORKS:
+//   1. Takes the user query + resolved entities (from 9_entityResolver.js)
+//   2. LLM creates a query plan (JSON steps)
+//      - But NOW the LLM already knows what each entity IS
+//      - "Nolan" is already resolved to Director "Christopher Nolan"
+//      - No guessing, no assumptions
+//   3. Template system validates + builds safe Cypher
+//   4. Execute on Neo4j (READ-ONLY)
+//   5. LLM formats the answer
+//
+// WHAT QUERIES DOES THIS HANDLE?
+//
+//   Factual:
+//     "Movies directed by Nolan" → traversal + filter
+//     "How many sci-fi movies?" → traversal + aggregation
+//     "Action movies with Tom Hardy" → multi-traversal + filter
+//
+//   Descriptive:
+//     "Tell me about Inception" → get ALL relationships around entity
+//     "Who is Christopher Nolan?" → get all relationships around entity
+//
+//   Relationship:
+//     "How is DiCaprio related to Nolan?" → path between two entities
+//
+// =====================================================================
+
+
+
+                 INDEXING PIPELINE
+                 (Offline Process)
+
+
+              Movie PDF Dataset
+                    |
+                    |
+                    ↓
+          ┌──────────────────┐
+          │  PDF Processing  │
+          └──────────────────┘
+                    |
+          ┌─────────┴─────────┐
+          |                   |
+          ↓                   ↓
+
+
+   STRUCTURED DATA PATH       SEMANTIC DATA PATH
+   (Knowledge Graph)          (Vector Database)
+
+
+          |                         |
+          ↓                         ↓
+
+
+    Gemini LLM                PDF Text Parser
+          |                         |
+          |                         ↓
+          |                    Text Chunks
+          |
+          ↓                         |
+   Entity Extraction                |
+          |                         |
+          ↓                         ↓
+
+   Structured JSON              Embedding Model
+          |                         |
+          |                         ↓
+          |                    Vector Embeddings
+          |                         |
+          ↓                         ↓
+
+       Neo4j                  Pinecone Database
+   Knowledge Graph            Vector Index
+
+
+//  pipeline for query phase............................
+
+                     USER
+                      |
+                      |
+                 User Question
+                      |
+                      ↓
+
+              Entity Resolver
+                      |
+                      ↓
+
+          Resolved Entities + Labels
+
+                      |
+                      ↓
+
+             Query Classifier
+
+              /                 \
+
+             /                   \
+
+        GRAPH QUERY          SIMILARITY QUERY
+
+             |                     |
+
+          Neo4j              Pinecone
+
+       Cypher Query       Vector Search
+
+             |                     |
+
+             └──────────┬──────────┘
+
+                        ↓
+
+                 Retrieved Context
+
+                        |
+
+                        ↓
+
+                     Gemini
+
+                        |
+
+                        ↓
+
+                  Final Response
